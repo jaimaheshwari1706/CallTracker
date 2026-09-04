@@ -237,6 +237,9 @@ fun DiagnosticsScreen(
                 if (device.backgroundRestricted) "YES (capture will stop)" else "NO"
             )
         }
+        item {
+            StatusRow("Active SIMs", device.activeSimCount?.toString() ?: "unknown")
+        }
         device.oemBackgroundNote?.let { note ->
             item {
                 Card(Modifier.fillMaxWidth()) {
@@ -290,14 +293,17 @@ fun DiagnosticsScreen(
         if (state.recentCalls.isEmpty()) {
             item { Text("None yet.", fontSize = 13.sp) }
         } else {
-            items(state.recentCalls, key = { it.id }) { call -> CallRow(call) }
+            // Keys are namespaced: call ids and event ids are independent
+            // autoincrement sequences and would otherwise collide in this
+            // single LazyColumn.
+            items(state.recentCalls, key = { "call-" + it.id }) { call -> CallRow(call) }
         }
 
         item { SectionHeader("Event log") }
         if (state.events.isEmpty()) {
             item { Text("Empty.", fontSize = 13.sp) }
         } else {
-            items(state.events, key = { it.id }) { event ->
+            items(state.events, key = { "event-" + it.id }) { event ->
                 Text(
                     clock(event.atEpochMs) + "  " + event.type.padEnd(18) + " " + event.detail,
                     fontFamily = FontFamily.Monospace,
@@ -329,7 +335,6 @@ private fun ExcludedNumberEditor(
                 singleLine = true,
                 modifier = Modifier.weight(1f)
             )
-            Spacer(Modifier.height(0.dp))
             Button(
                 onClick = {
                     if (input.isNotBlank()) {

@@ -40,13 +40,13 @@ class DiagnosticsStore(context: Context) {
 
     // --- signal 1: telephony ---
 
-    var lastTelephonyState: String
+    // Read-only outside this class: both values are written together by
+    // recordTelephonyState so the state and its timestamp can never disagree.
+    val lastTelephonyState: String
         get() = prefs.getString(KEY_TELEPHONY_STATE, "") ?: ""
-        private set(value) = prefs.edit().putString(KEY_TELEPHONY_STATE, value).apply()
 
-    var lastTelephonyStateAt: Long
+    val lastTelephonyStateAt: Long
         get() = prefs.getLong(KEY_TELEPHONY_STATE_AT, 0L)
-        private set(value) = prefs.edit().putLong(KEY_TELEPHONY_STATE_AT, value).apply()
 
     fun recordTelephonyState(state: String, atEpochMs: Long = System.currentTimeMillis()) {
         prefs.edit()
@@ -57,13 +57,11 @@ class DiagnosticsStore(context: Context) {
 
     // --- signal 2: content observer ---
 
-    var lastObserverEventAt: Long
+    val lastObserverEventAt: Long
         get() = prefs.getLong(KEY_OBSERVER_AT, 0L)
-        private set(value) = prefs.edit().putLong(KEY_OBSERVER_AT, value).apply()
 
-    var observerEventCount: Int
+    val observerEventCount: Int
         get() = prefs.getInt(KEY_OBSERVER_COUNT, 0)
-        private set(value) = prefs.edit().putInt(KEY_OBSERVER_COUNT, value).apply()
 
     fun recordObserverEvent(atEpochMs: Long = System.currentTimeMillis()) {
         prefs.edit()
@@ -88,13 +86,11 @@ class DiagnosticsStore(context: Context) {
 
     // --- sync ---
 
-    var lastSyncAt: Long
+    val lastSyncAt: Long
         get() = prefs.getLong(KEY_LAST_SYNC_AT, 0L)
-        private set(value) = prefs.edit().putLong(KEY_LAST_SYNC_AT, value).apply()
 
-    var lastSyncResult: String
+    val lastSyncResult: String
         get() = prefs.getString(KEY_LAST_SYNC_RESULT, "") ?: ""
-        private set(value) = prefs.edit().putString(KEY_LAST_SYNC_RESULT, value).apply()
 
     fun recordSync(result: String, atEpochMs: Long = System.currentTimeMillis()) {
         prefs.edit()

@@ -26,7 +26,7 @@ data class ScanResult(
  *
  * Concurrency: the ContentObserver fires several times for a single call on
  * most devices, and the telephony IDLE nudge can arrive in the middle of that
- * burst. Every scan therefore runs under [scanMutex]. Without it, two coroutines
+ * burst. Every scan therefore runs under a process-wide mutex. Without it, two coroutines
  * could both pass the "already processed" check for the same row before either
  * had written its marker. The database constraints would still stop the
  * duplicate row, but the counters and the diagnostic log would double-count,
@@ -42,9 +42,7 @@ class CallCaptureEngine(
     private val contactResolver: ContactResolver = ContactResolver(context)
 ) {
 
-    private val scanMutex = Mutex()
-
-    suspend fun scan(reason: ScanReason): ScanResult = scanMutex.withLock {
+    suspend fun scan(reason: ScanReason): ScanResult = SCAN_MUTEX.withLock {
         if (!DeviceInfoProvider.hasCallLogPermission(context)) {
             diagnostics.log(DiagnosticEvents.PERMISSION, "READ_CALL_LOG denied - scan skipped")
             return@withLock ScanResult(reason, skippedNoPermission = true)
@@ -196,5 +194,16 @@ class CallCaptureEngine(
             diagnostics.log(DiagnosticEvents.DUPLICATE_SKIPPED, "id=" + deviceCallId + " (insert raced)")
             CaptureAction.SKIP_DUPLICATE
         }
+    }
+
+    private companion object {
+        /**
+         * Process-wide, not per-instance. The service holds one engine and the
+         * periodic catch-up worker builds another; both can be scanning the same
+         * provider at the same time. The database constraints would still stop a
+         * duplicate row, but two overlapping scans would duplicate work and make
+         * the event log harder to read during an OEM test.
+         */
+        val SCAN_MUTEX = Mutex()
     }
 }

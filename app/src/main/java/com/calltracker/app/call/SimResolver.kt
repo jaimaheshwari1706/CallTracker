@@ -1,9 +1,9 @@
 package com.calltracker.app.call
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.content.Context
 import android.content.pm.PackageManager
-import android.os.Build
 import android.telephony.SubscriptionManager
 import androidx.core.content.ContextCompat
 
@@ -52,6 +52,15 @@ enum class SimResolution {
  */
 class SimResolver(private val context: Context) {
 
+    // resolve() checks READ_PHONE_STATE before calling this; lint cannot see
+    // through the helper, hence the suppression rather than a second redundant
+    // check. The call is also wrapped in runCatching at every call site.
+    @SuppressLint("MissingPermission")
+    private fun activeSubscriptions(): List<android.telephony.SubscriptionInfo> =
+        context.getSystemService(SubscriptionManager::class.java)
+            ?.activeSubscriptionInfoList
+            .orEmpty()
+
     fun resolve(rawPhoneAccountId: String?): SimInfo {
         val hasPermission = ContextCompat.checkSelfPermission(
             context, Manifest.permission.READ_PHONE_STATE
@@ -64,11 +73,7 @@ class SimResolver(private val context: Context) {
             )
         }
 
-        val subscriptions = runCatching {
-            val sm = context.getSystemService(SubscriptionManager::class.java)
-            @Suppress("MissingPermission")
-            sm?.activeSubscriptionInfoList.orEmpty()
-        }.getOrElse {
+        val subscriptions = runCatching { activeSubscriptions() }.getOrElse {
             return SimInfo(
                 rawPhoneAccountId = rawPhoneAccountId,
                 resolution = SimResolution.UNAVAILABLE
@@ -132,11 +137,9 @@ class SimResolver(private val context: Context) {
         resolution = SimResolution.RESOLVED
     )
 
-    /** True when the device reports more than one active SIM. Diagnostics only. */
+    /** How many active SIMs the device reports. Diagnostics only. */
+    @SuppressLint("MissingPermission")
     fun activeSimCount(): Int? = runCatching {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return@runCatching null
-        val sm = context.getSystemService(SubscriptionManager::class.java)
-        @Suppress("MissingPermission")
-        sm?.activeSubscriptionInfoCount
+        context.getSystemService(SubscriptionManager::class.java)?.activeSubscriptionInfoCount
     }.getOrNull()
 }

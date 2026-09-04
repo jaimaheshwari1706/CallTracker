@@ -1,7 +1,6 @@
 package com.calltracker.app.database
 
 import androidx.room.Dao
-import androidx.room.Delete
 import androidx.room.Insert
 import androidx.room.OnConflictStrategy
 import androidx.room.Query
@@ -32,9 +31,6 @@ abstract class CallDao {
 
     @Query("SELECT EXISTS(SELECT 1 FROM processed_call_log_rows WHERE deviceCallId = :deviceCallId)")
     abstract suspend fun isProcessed(deviceCallId: String): Boolean
-
-    @Query("SELECT EXISTS(SELECT 1 FROM calls WHERE deviceCallId = :deviceCallId)")
-    abstract suspend fun callExists(deviceCallId: String): Boolean
 
     /**
      * Persists an accepted call and its processed-marker atomically.
@@ -101,16 +97,6 @@ abstract class CallDao {
 
     @Query("SELECT * FROM calls ORDER BY startedAtEpochMs DESC LIMIT :limit")
     abstract fun observeRecentCalls(limit: Int = 25): Flow<List<CallEntity>>
-
-    /** Highest call-log id already decided on; used to seed the scan watermark. */
-    @Query("SELECT MAX(CAST(deviceCallId AS INTEGER)) FROM processed_call_log_rows")
-    abstract suspend fun highestProcessedCallLogId(): Long?
-
-    @Query("DELETE FROM calls")
-    abstract suspend fun deleteAllCalls()
-
-    @Query("DELETE FROM processed_call_log_rows")
-    abstract suspend fun deleteAllProcessedMarkers()
 }
 
 @Dao
@@ -118,9 +104,6 @@ interface ExcludedNumberDao {
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun exclude(entry: ExcludedNumberEntity)
-
-    @Delete
-    suspend fun remove(entry: ExcludedNumberEntity)
 
     @Query("DELETE FROM excluded_numbers WHERE normalizedNumber = :normalizedNumber")
     suspend fun removeByNumber(normalizedNumber: String)

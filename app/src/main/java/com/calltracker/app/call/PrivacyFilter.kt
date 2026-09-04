@@ -66,7 +66,4 @@ class PrivacyFilter(private val excludedNumberDao: ExcludedNumberDao) {
             .toSet()
         return PrivacyRules.evaluate(normalizedNumber, excluded)
     }
-
-    suspend fun isSyncable(normalizedNumber: String): Boolean =
-        evaluate(normalizedNumber).isSyncable
 }

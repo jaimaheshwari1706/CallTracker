@@ -21,7 +21,6 @@ android {
 
     buildFeatures {
         compose = true
-        buildConfig = true
     }
 
     composeOptions {
@@ -72,6 +71,7 @@ dependencies {
     implementation("com.squareup.retrofit2:retrofit:2.11.0")
     implementation("com.squareup.retrofit2:converter-moshi:2.11.0")
 
+    // The unit tests cover pure logic only, so plain JUnit is enough - no
+    // Robolectric, no coroutines-test, no mocking framework.
     testImplementation("junit:junit:4.13.2")
-    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.8.1")
 }

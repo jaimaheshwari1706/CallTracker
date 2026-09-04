@@ -7,6 +7,7 @@ import android.content.pm.PackageManager
 import android.os.Build
 import android.os.PowerManager
 import androidx.core.content.ContextCompat
+import com.calltracker.app.call.SimResolver
 
 /**
  * Everything the OEM matrix needs to identify the row a test result belongs to,
@@ -22,6 +23,8 @@ data class DeviceInfo(
     val appVersionCode: Long,
     val ignoringBatteryOptimizations: Boolean,
     val backgroundRestricted: Boolean,
+    /** null when READ_PHONE_STATE is denied or the platform would not say. */
+    val activeSimCount: Int?,
     val oemBackgroundNote: String?
 ) {
     val deviceLabel: String get() = "$manufacturer $model"
@@ -63,6 +66,7 @@ object DeviceInfoProvider {
             appVersionCode = versionCode,
             ignoringBatteryOptimizations = ignoring,
             backgroundRestricted = restricted,
+            activeSimCount = SimResolver(context).activeSimCount(),
             oemBackgroundNote = oemBackgroundNote()
         )
     }
