@@ -1,0 +1,22 @@
+.gradle/
+.idea/
+*.iml
+local.properties
+build/
+app/build/
+*.apk
+*.aab
+captures/
+.externalNativeBuild/
+.cxx/
+.DS_Store
+Thumbs.db
+
+# Signing material — never commit these.
+*.jks
+*.keystore
+key.properties
+keystore.properties
+*.p12
+*.pepk
+google-services.json

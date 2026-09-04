@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!--
+      Permissions the POC actually uses. Each one is mapped to the code that
+      needs it so nothing is requested "just in case":
+
+        READ_CALL_LOG   CallLogReader — querying CallLog.Calls.CONTENT_URI and
+                        registering the ContentObserver on it. This is the
+                        source of truth for a completed call.
+        READ_PHONE_STATE
+                        CallMonitorService — TelephonyManager.registerTelephonyCallback
+                        with a CallStateListener, and SimResolver's
+                        SubscriptionManager lookup.
+        READ_CONTACTS   ContactResolver — OPTIONAL. Only used to show a local
+                        display name next to a captured call on the diagnostics
+                        screen. Never included in a sync payload. The app runs
+                        fully without it.
+        INTERNET / ACCESS_NETWORK_STATE
+                        Declared for the WorkManager NetworkType.CONNECTED
+                        constraint. No network call is made by this POC.
+        FOREGROUND_SERVICE / FOREGROUND_SERVICE_DATA_SYNC
+                        CallMonitorService keeps the observer alive.
+        POST_NOTIFICATIONS
+                        Android 13+ needs this for the foreground-service
+                        notification to actually be visible during testing.
+        RECEIVE_BOOT_COMPLETED
+                        BootReceiver — restart monitoring after reboot.
+        REQUEST_IGNORE_BATTERY_OPTIMIZATIONS
+                        Diagnostics screen offers the exemption prompt so the
+                        OEM matrix can compare optimized vs exempted runs.
+    -->
+    <uses-permission android:name="android.permission.READ_CALL_LOG" />
+    <uses-permission android:name="android.permission.READ_PHONE_STATE" />
+    <uses-permission android:name="android.permission.READ_CONTACTS" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
+    <!--
+      Deliberately NOT requested: RECORD_AUDIO, PROCESS_OUTGOING_CALLS,
+      CALL_PHONE, ANSWER_PHONE_CALLS, and no ROLE_DIALER / default-dialer
+      intent filters. This POC does not replace the user's dialer and does not
+      record audio — that is the whole point of the experiment.
+    -->
+
+    <application
+        android:name=".CallTrackerApp"
+        android:allowBackup="false"
+        android:label="CallTracker POC"
+        android:theme="@android:style/Theme.Material.Light">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name=".call.CallMonitorService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
+        <!--
+          exported="true" is required here: BOOT_COMPLETED is delivered by the
+          system (a different UID), so a non-exported receiver would never fire.
+          BOOT_COMPLETED is a protected broadcast, so only the system can send it.
+        -->
+        <receiver
+            android:name=".call.BootReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <!-- Some OEM builds (notably HTC/older Samsung) use this instead. -->
+                <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+            </intent-filter>
+        </receiver>
+
+    </application>
+
+</manifest>
