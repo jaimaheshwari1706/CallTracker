@@ -324,7 +324,7 @@ processedAtEpochMs  = <when we looked at it>
 
 No phone number, no contact name, no call time, no duration. The row exists only so the same call is not re-evaluated and re-counted on the next notification.
 
-The diagnostic event log records `PRIVACY_CHECK EXCLUDED id=1234` — the call-log id, not the number. Numbers that **pass** the filter are logged masked (`********3210`).
+The diagnostic event log records `CALL_EXCLUDED_PRIVACY callLogId=1234 result=EXCLUDED fp=9f2c1a7b` — the call-log id and a fingerprint, not the number. Numbers that **pass** the filter are logged masked (`num=********3210`) plus the same fingerprint.
 
 ### Current limitation — exclusion-list UI
 
@@ -495,57 +495,101 @@ There is deliberately **no** "just pick slot 0" fallback. When resolution fails,
 
 The diagnostics screen is the actual product of this POC. A tester should be able to fill in a matrix row from it without `adb`.
 
-It shows:
+### Pre-flight
+
+The top of the screen is a pre-flight gate. Every row is PASS / WARN / FAIL with a one-line observation and, for anything not PASS, why it matters and an action button:
+
+| Check | PASS when | Otherwise |
+|---|---|---|
+| `READ_CALL_LOG` | granted | **FAIL** → Open app settings |
+| `READ_PHONE_STATE` | granted | **FAIL** → Open app settings |
+| `READ_CONTACTS` (optional) | granted | WARN → Open app settings |
+| `POST_NOTIFICATIONS` (API 33+) | granted | WARN → Open notification settings |
+| Monitoring service | process reports the service running **and** `monitoringActive` | FAIL; a stale flag (flag set, service gone) is called out explicitly — that is an OEM kill |
+| ContentObserver | registered while the service runs | FAIL |
+| TelephonyCallback | registered while the service runs | FAIL |
+| Room database | opens; reports schema version | FAIL |
+| Catch-up worker | WorkManager reports ENQUEUED/RUNNING; shows last run | WARN → Start monitoring |
+| Exclusion list | at least one number | WARN (privacy filter cannot be exercised) |
+| Device / Android / App version | informational | Android 15+ carries a note about the dataSync time limit |
+| Background restriction | not restricted | **FAIL** → Open app settings |
+| Battery optimization | exempted | WARN — *"background reliability must be validated"* |
+| OEM background policy | — | always WARN on OEMs known to need a manual opt-in |
+| SIM / subscriptions | one active SIM | WARN for dual SIM (mapping unverified), for none, or when the platform will not say |
+
+**A full column of PASS means the pipeline is wired. It does not mean background capture will survive this OEM's battery manager — nothing observable from inside the process can prove that, which is why the battery and OEM rows are WARN with "must be validated" wording.**
+
+The pre-flight never requests a permission on its own. Every action opens the relevant Android settings screen or starts the existing monitoring flow; permission dialogs are only ever launched from the permission screen the user walked through at onboarding.
+
+### Status rows
 
 ```text
-Permissions
-  Call log (READ_CALL_LOG)              GRANTED / DENIED
-  Phone state (READ_PHONE_STATE)        GRANTED / DENIED
-  Contacts (READ_CONTACTS, optional)    GRANTED / DENIED
-
-Monitoring
-  Monitoring                            ACTIVE / INACTIVE
-  Started                               <timestamp>
-  Last ContentObserver event            <timestamp> (N total)
-  Last TelephonyCallback state          OFFHOOK / IDLE / RINGING at <timestamp>
-  Highest call-log id scanned           <id>
-  Foreground service timed out          <timestamp, only if it happened>
-
-Calls
-  Captured                              N
-  Excluded by privacy filter            N
-  Pending sync                          N
-  Synced                                N
-  Failed                                N
-  Last captured call                    <timestamp>
-  Last sync                             <timestamp> <result>
-
-Device
-  Manufacturer / Model                  <...>
-  Android                               Android 14 (API 34)
-  App version                           0.2-poc (2)
-  Battery optimization                  EXEMPTED / OPTIMIZED
-  Background restricted                 YES / NO
-  Active SIMs                           N / unknown
-  OEM background policy                 <manufacturer-specific instruction>
+Permissions      call log / phone state / contacts / notifications
+Monitoring       ACTIVE/INACTIVE, last started, observer registered, telephony registered,
+                 last observer event (+count), last telephony state, last scan (+reason, +result),
+                 highest call-log id scanned, last catch-up worker run, FGS timeout (if it happened)
+Calls            stored, excluded, duplicates detected, pending, synced, failed,
+                 sync runs succeeded / failed, last stored call, last sync
+Last call trace  every event carrying the most recently evaluated call-log id, oldest first
+Device           manufacturer, model, Android/API, app version, battery optimization,
+                 background restricted, active SIMs, OEM background-policy note
 ```
 
-Plus the actions **Start / Stop / Rescan / Sync now / Retry failed / Battery settings / Clear log**, the exclusion-list control, the 25 most recent captured calls with their call-log id, direction, status, duration, start, end and SIM slot, and a live event log:
+### Actions
+
+`Start` / `Stop` / `Rescan` / `Sync now` / `Retry failed` / `Battery settings` / `Clear diagnostics`.
+
+**Clear diagnostics** empties the event log and resets the diagnostic counters (observer count, duplicates, sync counts, last-seen timestamps). It does **not** touch stored calls, the processed-row ledger, the scan watermark, the exclusion list, or consent — clearing diagnostics never changes what the pipeline does next.
+
+### Privacy exclusions
+
+One field, `Exclude`, a list with `Remove`, and `Dry-run check`. Dry-run runs the typed number through normalize → privacy filter against the real on-device list and writes one `SIMULATED` line to the event log. It stores nothing, touches no ledger, queues nothing, and is never a call.
+
+### Event log
+
+Every event is one row: timestamp, type, and a detail string of `key=value` pairs. Phone numbers never appear in full — they are rendered as a mask (`num=********3210`) plus a stable fingerprint (`fp=9f2c1a7b`, first 8 hex of SHA-256 of the normalized number) so a tester can tell "these events were the same number" without the number ever being logged. Nothing is written to Logcat.
+
+A real outgoing call reads top to bottom like this:
 
 ```text
-14:31:02  TELEPHONY          OFFHOOK
-14:34:18  TELEPHONY          IDLE
-14:34:19  CALL_LOG_CHANGED   selfChange=false
-14:34:19  SCAN               START reason=CALL_LOG_CHANGED after=1233 limit=50
-14:34:19  CALL_LOG_READ      id=1234 type=2 dur=41s
-14:34:19  PRIVACY_CHECK      PASSED id=1234 ********3210
-14:34:19  CALL_SAVED         id=1234 OUTGOING/ANSWERED 41s
-14:34:19  SCAN               DONE reason=CALL_LOG_CHANGED rows=1 saved=1 excluded=0 dup=0
+14:31:02  TELEPHONY_STATE           state=OFFHOOK
+14:34:18  TELEPHONY_STATE           state=IDLE
+14:34:19  CALL_LOG_CHANGE_DETECTED  selfChange=false
+14:34:19  SCAN_STARTED              reason=CALL_LOG_CHANGED after=1233 limit=50
+14:34:19  CALL_LOG_ROWS_FOUND       reason=CALL_LOG_CHANGED rows=1
+14:34:19  CALL_ROW_EVALUATED        callLogId=1234 type=2 durationS=41 num=********3210 fp=9f2c1a7b
+14:34:19  CALL_ALLOWED              callLogId=1234 result=ALLOW
+14:34:19  SIM_RESOLUTION            callLogId=1234 result=RESOLVED slot=0 subId=1 phoneAccountId=1
+14:34:19  CALL_STORED               callLogId=1234 direction=OUTGOING status=ANSWERED durationS=41 sim=RESOLVED syncStatus=PENDING
+14:34:19  SCAN_FINISHED             reason=CALL_LOG_CHANGED rows=1 stored=1 excluded=0 duplicates=0
+14:34:19  CALL_SYNC_QUEUED          reason=CALL_LOG_CHANGED stored=1
+14:34:20  WORKER_STARTED            worker=CallSyncWorker attempt=0
+14:34:20  SYNC_STARTED              batch=1 client=LocalLoopbackSyncClient callLogIds=1234
+14:34:20  SYNC_SUCCEEDED            batch=1 outcome=SUCCESS status=SYNCED attempts=1 willRetry=false
+14:34:20  WORKER_FINISHED           worker=CallSyncWorker result=SYNCED
 ```
 
-Event types: `SERVICE_STARTED`, `SERVICE_STOPPED`, `SERVICE_TIMEOUT`, `BOOT`, `PERMISSION`, `TELEPHONY`, `CALL_LOG_CHANGED`, `SCAN`, `CALL_LOG_READ`, `DUPLICATE_SKIPPED`, `PRIVACY_CHECK`, `CALL_SAVED`, `SIM`, `SYNC`, `ERROR`.
+The same call re-notified a second later produces `CALL_LOG_CHANGE_DETECTED` → `SCAN_STARTED` → `CALL_LOG_ROWS_FOUND rows=0` (watermark) or `CALL_DUPLICATE callLogId=1234 reason=already_in_processed_ledger` (catch-up) — and nothing else.
 
-The event log never contains a full phone number.
+Full vocabulary:
+
+| Type | Fields |
+|---|---|
+| `SERVICE_STARTED` / `SERVICE_STOPPED` / `SERVICE_TIMEOUT` | observer, telephony / reason / fgsType, fallback |
+| `BOOT_RECEIVED` | action, catchUp, serviceStart |
+| `WORKER_STARTED` / `WORKER_FINISHED` | worker, attempt / result, rows, stored, excluded, duplicates, serviceRestart |
+| `PERMISSION_CHANGED` | permission+state+effect, or a snapshot of all four |
+| `TELEPHONY_STATE` | state |
+| `CALL_LOG_CHANGE_DETECTED` | selfChange |
+| `SCAN_STARTED` / `CALL_LOG_ROWS_FOUND` / `SCAN_FINISHED` | reason, after, limit / rows / stored, excluded, duplicates |
+| `CALL_ROW_EVALUATED` | callLogId, type, durationS, num (masked), fp |
+| `CALL_ALLOWED` / `CALL_EXCLUDED_PRIVACY` / `CALL_DUPLICATE` | callLogId, result / fp / reason |
+| `SIM_RESOLUTION` | callLogId, result, slot, subId, phoneAccountId |
+| `CALL_STORED` | callLogId, direction, status, durationS, sim, syncStatus |
+| `CALL_SYNC_QUEUED` | reason, stored |
+| `SYNC_STARTED` / `SYNC_SUCCEEDED` / `SYNC_FAILED` | batch, client, callLogIds / outcome, status, attempts, willRetry |
+| `SIMULATED` | what, num, fp, result, stored=false |
+| `ERROR` | where, exception, message, plus context |
 
 ---
 
@@ -587,10 +631,15 @@ These run on the JVM with no device and cover the logic that is worth pinning:
 | File | Covers |
 |---|---|
 | `PhoneNumbersTest` | normalization across `+91…`, `91…`, `09…`, `00 91…`, formatted, short-code, withheld and blank inputs; that all renderings of one number collapse to one value; diagnostic masking |
-| `PrivacyRulesTest` | allow/exclude, empty list, cross-format matching, near-miss numbers not colliding, withheld caller ids flagged rather than silently allowed |
-| `CallLogMappingTest` | direction vs status separation, every `CallLog.Calls.*_TYPE`, unknown types, negative-duration clamping, `endedAt` arithmetic |
-| `DeduplicationTest` | one call notified five times yields one store; restart re-scan stores nothing; catch-up stores only new rows; excluded rows not re-counted; watermark monotonicity |
-| `SyncStateMachineTest` | every legal transition, attempt-budget exhaustion, `SYNCED` terminality, and that the sync payload carries no contact name |
+| `PrivacyRulesTest` | allow/exclude, empty list, cross-format matching, near-miss numbers not colliding, withheld caller ids flagged; and the input-format matrix: exact, `+91`, local `0`-prefixed, spaces, hyphens, parentheses, leading/trailing whitespace, unknown/withheld |
+| `CallLogMappingTest` | direction vs status separation, every `CallLog.Calls.*_TYPE`, unknown types, negative-duration clamping, `endedAt` arithmetic; representative rows for the Phase 2/3/4 test calls |
+| `DeduplicationTest` | the pure ordering rule (`CapturePipeline`): one call notified five times yields one store; restart re-scan stores nothing; catch-up stores only new rows; excluded rows not re-counted; watermark monotonicity |
+| `DeduplicationLedgerTest` | the **real `CallDao.recordAccepted` / `recordExcluded` bodies** run against an in-memory fake of the abstract Room methods (`FakeCallDao`): A. same id twice; B. 50 near-simultaneous transactions → one store, and the same with serialization deliberately removed → uniqueness alone still yields one row; C. observer scan and catch-up scan racing over overlapping rows; D. excluded row seen three times, and cannot later be stored; E. allowed row seen five times; a lost watermark causes no duplicates |
+| `SyncQueueFlowTest` | stored → `PENDING` → loopback → `SYNCED`; synced calls are not re-sent; transient failures retry; budget exhaustion → `FAILED` → `Retry failed` → `SYNCED`; permanent failure; throwing client; payload carries no contact name and no excluded rows |
+| `SyncStateMachineTest` | every legal transition, attempt-budget exhaustion, `SYNCED` terminality, payload excludes contact name |
+| `DiagnosticsFormatTest` | `key=value` rendering, whitespace collapsing, mask shows last 4 only, fingerprint is stable across renderings and never contains the number, last-call-trace derivation ignores the plural `callLogIds=` key |
+
+`FakeCallDao` subclasses the real abstract `CallDao`, so the `@Transaction` helper logic under test is the production code. Room's transaction serialization is modelled by a mutex and its UNIQUE index by `putIfAbsent`; this verifies the logic we wrote, not Room's implementation of it.
 
 ### What unit tests do not prove
 
@@ -643,78 +692,106 @@ The debug build is signed with the local Android Studio development key. There i
 
 ## 15. Physical-device test procedure
 
-Do not open the app, make one call, and declare success.
+Do not open the app, make one call, and declare success. Work through the phases in order; each phase has an explicit expected result, and the event log is the evidence.
 
-### First-run setup, per device
+Bring: the test phone, a second phone, a USB cable, and the matrix row for this device.
 
-1. Install the app and open it.
+### Phase 1 — install, permissions, pre-flight
+
+1. Install the debug APK (`adb install -r app/build/outputs/apk/debug/app-debug.apk` or Run from Android Studio) and open it.
 2. Read the privacy explanation and continue.
-3. Grant the **required** permissions (call log, phone state).
-4. Grant or explicitly deny the **optional** ones (contacts, notifications) and note which.
-5. Confirm the foreground notification appears.
-6. On the diagnostics screen, confirm **Monitoring: ACTIVE**.
-7. Note **Battery optimization** and **Background restricted**.
-8. Read the **OEM background policy** note and grant the manufacturer-specific opt-in it describes, by hand, in system settings.
-9. Note the device, model, Android version, default dialer app and app version.
+3. Grant the **required** permissions (call log, phone state). Grant or explicitly deny the **optional** ones (contacts, notifications) and note which.
+4. On the diagnostics screen, read the **Pre-flight** section top to bottom.
+   - Every FAIL must be fixed before continuing; each row has a button that opens the right settings screen.
+   - Every WARN must be read and noted. `Battery optimization` and `OEM background policy` WARNs are expected — they are the thing Phases 7–9 measure, not something to silence.
+5. Press **Start** if Monitoring is not ACTIVE. Confirm the foreground notification appears.
+6. Confirm `ContentObserver registered = YES` and `TelephonyCallback registered = YES`.
+7. Record in the matrix: device/model, Android version, default dialer app (confirm CallTracker is **not** it), app version, which permissions were granted, battery-optimization state.
 
-### The three baseline calls
+**Expected:** pre-flight shows no FAIL; `SERVICE_STARTED observer=true telephony=true` in the event log, followed by a `SCAN_STARTED reason=CATCH_UP` / `SCAN_FINISHED`.
 
-Run these with the app open first, so a failure is unambiguous.
+### Phase 2 — one outgoing answered call
 
-**Outgoing call**
+1. Note **Stored** and **Pending sync**.
+2. From the phone's normal dialer, call the second phone. Answer it there. Talk for ~40 seconds. Hang up from the test phone.
+3. Within a few seconds, **Last call trace** should show, in order:
+   `CALL_ROW_EVALUATED` → `CALL_ALLOWED result=ALLOW` → `SIM_RESOLUTION` → `CALL_STORED direction=OUTGOING status=ANSWERED`, and the full log should also show `TELEPHONY_STATE state=OFFHOOK` → `state=IDLE` → `CALL_LOG_CHANGE_DETECTED` → `SCAN_STARTED` before them, and `CALL_SYNC_QUEUED` → `SYNC_STARTED` → `SYNC_SUCCEEDED` after.
+4. **Stored** increased by exactly 1. **Synced** increased by 1 (the loopback client). **Pending sync** is back to 0.
+5. In **Recent stored calls**: `OUTGOING / ANSWERED`, duration within **±2 s** of the phone's own call-log entry, start time matching.
 
-1. Note **Captured** on the diagnostics screen.
-2. Dial a number from the phone's normal dialer. Let it connect. Talk for ~40 seconds. Hang up.
-3. Within a few seconds the event log should show:
-   `TELEPHONY OFFHOOK` → `TELEPHONY IDLE` → `CALL_LOG_CHANGED` → `CALL_LOG_READ id=…` → `PRIVACY_CHECK PASSED` → `CALL_SAVED id=… OUTGOING/ANSWERED`.
-4. **Captured** increased by exactly 1. **Pending sync** increased by 1.
-5. In *Recent captured calls*: direction `OUTGOING`, status `ANSWERED`, duration within ±2 s of the phone's own call log, start time matching.
+**Record:** ContentObserver fired? TelephonyCallback fired? direction correct? status correct? duration delta in seconds. SIM `result=` value.
 
-**Incoming call**
+### Phase 3 — one incoming answered call
 
-1. Have a second phone call this device. Answer it. Talk for ~30 seconds. Hang up.
-2. Expect the same event sequence, ending `CALL_SAVED id=… INCOMING/ANSWERED`.
-3. **Captured** increased by exactly 1, direction `INCOMING`, duration within ±2 s.
+1. Have the second phone call the test phone. Answer. Talk ~30 s. Hang up.
+2. Same event chain, ending `CALL_STORED direction=INCOMING status=ANSWERED`.
+3. **Stored** +1, duration within ±2 s.
 
-**Missed call**
+### Phase 4 — one missed call
 
-1. Have the second phone call this device. Do **not** answer. Let it ring out.
-2. Expect `TELEPHONY RINGING` → `TELEPHONY IDLE` → `CALL_LOG_CHANGED` → `CALL_SAVED id=… INCOMING/MISSED`.
-3. Duration is `0` and `ended == started`. That is correct: the call never connected.
-4. **Captured** increased by exactly 1.
+1. Have the second phone call the test phone. Do **not** answer. Let it ring out.
+2. Expect `TELEPHONY_STATE state=RINGING` → `state=IDLE` → … → `CALL_STORED direction=INCOMING status=MISSED durationS=0`.
+3. In Recent stored calls: duration `0` and `ended == started`. That is correct, not a bug — the call never connected.
+4. **Stored** +1.
 
-After all three: **Captured** increased by exactly 3, and *Recent captured calls* shows three distinct `callLogId` values. **Any repeated `callLogId`, or a Captured count above 3, is a duplication failure.**
+After Phases 2–4: **Stored increased by exactly 3**, three distinct `callLogId` values in Recent stored calls, **Duplicates detected** is whatever it was (it counts re-notifications that were correctly skipped, and may legitimately be > 0), and **no `callLogId` appears twice in Recent stored calls.**
 
-### Privacy-filter check
+### Phase 5 — repeat, verify zero duplicates
 
-1. On the diagnostics screen, add the second phone's number to the exclusion list. Any format is fine — it is normalized on save.
-2. Note **Captured** and **Excluded by privacy filter**.
-3. Make a call to or from that number.
-4. Expect `PRIVACY_CHECK EXCLUDED id=…` in the event log.
-5. **Excluded** increased by 1. **Captured** did **not** change. **Pending sync** did **not** change.
-6. The number does not appear in *Recent captured calls*.
-7. Press **Rescan** twice. **Excluded** must not increase again.
+1. Repeat Phases 2–4 twice more, spaced at least a few minutes apart (six more calls).
+2. Press **Rescan** twice after the last one.
+3. Press **Sync now** twice.
 
-### Background, screen-off and recents
+**Expected:** Stored increased by exactly 6 more. Rescan produces `SCAN_STARTED reason=MANUAL` … `SCAN_FINISHED stored=0`. Each `CALL_DUPLICATE` line names a `callLogId` that already exists in Recent stored calls. Sync now produces `WORKER_FINISHED result=NOTHING_PENDING`. **Any `callLogId` appearing twice in Recent stored calls is a duplication FAIL and stops the session.**
 
-8. Put the app in the background (Home). Make a call. Verify it is captured.
-9. Lock the screen. Make a call. Wait 30 seconds after it ends. Unlock and check.
-10. Swipe the app out of recents. Make a call. Check immediately, and again after 20 minutes — a capture that appears only on the later check means the foreground service was killed and the periodic catch-up recovered it. Record which.
-11. Leave the device idle for several hours, then make a call and check.
+### Phase 6 — excluded personal number
 
-### Reboot
+1. In **Privacy exclusions**, type the second phone's number in any format and press **Dry-run check**. Expect `SIMULATED … result=ALLOW stored=false` (it is not excluded yet).
+2. Press **Exclude**. The normalized number appears in the list; pre-flight `Exclusion list` becomes PASS on Re-run.
+3. Press **Dry-run check** again with the number in a *different* format (e.g. with spaces, or without `+91`). Expect `SIMULATED … result=EXCLUDED`.
+4. Note **Stored**, **Excluded by privacy filter**, **Pending sync**.
+5. Make one call to, and one call from, the second phone (answered, ~10 s each).
+6. **Expected per call:** `CALL_ROW_EVALUATED` → `CALL_EXCLUDED_PRIVACY callLogId=… result=EXCLUDED`. No `CALL_STORED`, no `CALL_SYNC_QUEUED`, no `SYNC_STARTED`.
+7. **Excluded** +2. **Stored** unchanged. **Pending sync** unchanged. The number is not in Recent stored calls.
+8. Press **Rescan** twice. **Excluded** must not change (`CALL_DUPLICATE … reason=already_in_processed_ledger` or `rows=0`).
+9. Press **Remove** on the number. Press **Rescan**. **Stored** must still not change — the ledger already decided those rows.
 
-12. Reboot the device. Do **not** open the app.
-13. Make a call. Check after ~20 minutes, then open the app.
-14. Record whether the event log shows `BOOT` with `service start=requested` or with an exception name.
+### Phase 7 — screen locked
 
-### Battery optimization comparison
+1. Lock the screen. Wait 30 s.
+2. Have the second phone (now removed from the exclusion list, or use a third number) call the test phone. Answer from the locked screen, talk ~20 s, hang up. Leave the screen locked for a further 60 s.
+3. Unlock, open the app.
 
-15. Run steps 8–11 with battery optimization **on**, then grant the exemption via **Battery settings** and run them again. Record both.
+**Expected:** `CALL_STORED` with a timestamp within seconds of hang-up. If instead the only capture is via `WORKER_STARTED worker=CallLogCatchUpWorker` up to 15 min later, the foreground service did not survive screen-off — record that, it is a finding not a failure of the test.
 
-### Dual SIM
+### Phase 8 — removed from recents
 
-16. On a dual-SIM device, place one call on each SIM. Record the `SIM` event lines and whether *Recent captured calls* shows a slot or `unknown`.
+1. Open the app, then swipe it out of Recents.
+2. Make one outgoing call (~20 s).
+3. Re-open the app **immediately** and note whether the call is already stored and whether pre-flight shows `Monitoring service` PASS or the stale-flag FAIL.
+4. If not captured: wait 20 minutes without opening the app, then open it.
+
+**Expected / record:** captured immediately (service survived), captured by catch-up within ~15 min (service killed, worker recovered), or not captured (both failed — record `WORKER_*` lines and any `ERROR`).
+
+### Phase 9 — reboot
+
+1. Reboot the device. Do **not** open the app.
+2. After boot completes, wait 2 minutes, then make one incoming call (~20 s).
+3. Wait a further 20 minutes. Then open the app.
+
+**Expected / record:** a `BOOT_RECEIVED action=… serviceStart=requested` or `serviceStart=<ExceptionName>` line. On Android 15 `serviceStart` is expected to be refused for a `dataSync` service; capture then depends on the catch-up worker. Record whether the call was stored, and whether pre-flight shows Monitoring service PASS after the app was opened.
+
+### Phase 10 — dual SIM (if supported)
+
+1. Confirm pre-flight `SIM / subscriptions` reports 2 active SIMs.
+2. Place one outgoing call on SIM 1 and one on SIM 2 (use the dialer's SIM chooser).
+3. For each, read the `SIM_RESOLUTION` line: `result=RESOLVED slot=N` means the mapping worked; `result=UNRESOLVED phoneAccountId=…` means it did not — copy the raw `phoneAccountId` value into the matrix.
+
+**Do not build anything on top of SIM resolution until this column is filled for every pilot device.**
+
+### Battery-optimization comparison
+
+Run Phases 7–9 once with battery optimization **on** (the default), then press **Battery settings**, grant the exemption, confirm pre-flight shows `Battery optimization: exempted`, and run them again. Record both.
 
 ### Volume
 
@@ -1176,7 +1253,11 @@ That is the product we are validating — not merely a call-log viewer.
 
 ## 26. Current status
 
-**Technical POC:** capture pipeline implemented (two signals, dedupe, privacy filter, Room, diagnostics). **Not compiled or run by the author on any device, and not validated on any hardware.** Unit tests exist for the pure logic; nothing else has been executed.
+**Technical POC:** capture pipeline implemented (two signals, dedupe, privacy filter, Room, diagnostics, pre-flight). `./gradlew :app:testDebugUnitTest` (88 tests) and `./gradlew :app:assembleDebug` both pass on the development machine. **Not yet run on any physical device; nothing about real-device behaviour is validated.**
+
+**Proven so far:** the code compiles, the unit tests pass, a debug APK builds, and the diagnostic instrumentation exists.
+
+**Not yet proven:** that the ContentObserver fires reliably on physical devices; that TelephonyCallback behaves on every target device; background capture; screen-off capture; reboot recovery; OEM battery behaviour; dual-SIM mapping; ±2 s duration accuracy on real devices; that no duplicates occur under real-world event timing.
 
 **Production readiness:** not claimed, and not close.
 

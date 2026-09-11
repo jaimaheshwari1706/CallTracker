@@ -84,4 +84,85 @@ class PrivacyRulesTest {
         assertEquals(PrivacyDecision.EXCLUDED, PrivacyRules.evaluate("121", excluded))
         assertEquals(PrivacyDecision.ALLOW, PrivacyRules.evaluate("1210", excluded))
     }
+
+    // ------------------------------------------------------------------
+    // Input formats a real dialer/carrier writes into CallLog.Calls.NUMBER.
+    // The invariant: an excluded personal number never passes, whatever the
+    // rendering. Each raw string goes through the same normalizePhoneNumber()
+    // the engine uses, then the same PrivacyRules.evaluate().
+    // ------------------------------------------------------------------
+
+    private val excludedSavedAsTyped = setOf(normalizePhoneNumber("98765 43210"))
+
+    private fun decisionFor(rawFromCallLog: String) =
+        PrivacyRules.evaluate(normalizePhoneNumber(rawFromCallLog), excludedSavedAsTyped)
+
+    @Test
+    fun `format - exact excluded number`() {
+        assertEquals(PrivacyDecision.EXCLUDED, decisionFor("9876543210"))
+    }
+
+    @Test
+    fun `format - international +91 rendering`() {
+        assertEquals(PrivacyDecision.EXCLUDED, decisionFor("+919876543210"))
+    }
+
+    @Test
+    fun `format - local Indian trunk-prefixed rendering`() {
+        assertEquals(PrivacyDecision.EXCLUDED, decisionFor("09876543210"))
+    }
+
+    @Test
+    fun `format - country code without plus`() {
+        assertEquals(PrivacyDecision.EXCLUDED, decisionFor("919876543210"))
+    }
+
+    @Test
+    fun `format - spaces`() {
+        assertEquals(PrivacyDecision.EXCLUDED, decisionFor("+91 98765 43210"))
+    }
+
+    @Test
+    fun `format - hyphens`() {
+        assertEquals(PrivacyDecision.EXCLUDED, decisionFor("+91-98765-43210"))
+    }
+
+    @Test
+    fun `format - parentheses`() {
+        assertEquals(PrivacyDecision.EXCLUDED, decisionFor("(+91) 98765-43210"))
+        assertEquals(PrivacyDecision.EXCLUDED, decisionFor("(0) 98765 43210"))
+    }
+
+    @Test
+    fun `format - leading and trailing whitespace`() {
+        assertEquals(PrivacyDecision.EXCLUDED, decisionFor("   +919876543210   "))
+        assertEquals(PrivacyDecision.EXCLUDED, decisionFor("\t9876543210\n"))
+    }
+
+    @Test
+    fun `format - a different number in the same formats is still allowed`() {
+        assertEquals(PrivacyDecision.ALLOW, decisionFor("+91 98765 43211"))
+        assertEquals(PrivacyDecision.ALLOW, decisionFor("(0) 98765-43211"))
+    }
+
+    @Test
+    fun `format - withheld and unknown renderings are flagged, never matched`() {
+        for (raw in listOf("", "   ", "-1", "-2", "-3", "Unknown", "PRIVATE")) {
+            assertEquals(
+                "raw='" + raw + "'",
+                PrivacyDecision.ALLOW_UNRESOLVED_NUMBER,
+                decisionFor(raw)
+            )
+        }
+    }
+
+    @Test
+    fun `the exclusion list itself is normalized on read so any saved format matches`() {
+        // What PrivacyFilter does before calling PrivacyRules: normalize every
+        // saved entry. A list saved in three formats collapses to one value.
+        val saved = listOf("+91 98765 43210", "09876543210", "9876543210")
+        val normalizedList = saved.map { normalizePhoneNumber(it) }.toSet()
+        assertEquals(1, normalizedList.size)
+        assertEquals(PrivacyDecision.EXCLUDED, PrivacyRules.evaluate(normalizePhoneNumber("919876543210"), normalizedList))
+    }
 }

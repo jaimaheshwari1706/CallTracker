@@ -29,16 +29,33 @@ class CallSyncWorker(
         val diagnostics = DiagnosticsStore(applicationContext)
         val dao = db.callDao()
 
+        diagnostics.event(
+            DiagnosticEvents.WORKER_STARTED,
+            "worker" to DiagnosticEvents.WORKER_SYNC, "attempt" to runAttemptCount
+        )
+
         val pending = dao.getPendingBatch(limit = BATCH_SIZE)
         if (pending.isEmpty()) {
-            diagnostics.recordSync("nothing pending")
+            diagnostics.recordSync("nothing pending", succeeded = null)
+            diagnostics.event(
+                DiagnosticEvents.WORKER_FINISHED,
+                "worker" to DiagnosticEvents.WORKER_SYNC, "result" to "NOTHING_PENDING"
+            )
             return Result.success()
         }
+
+        diagnostics.event(
+            DiagnosticEvents.SYNC_STARTED,
+            "batch" to pending.size,
+            "client" to client.javaClass.simpleName,
+            "callLogIds" to pending.joinToString(",") { it.deviceCallId }
+        )
 
         val now = System.currentTimeMillis()
         val outcome = try {
             client.sync(deviceId(), pending.map { it.toSyncPayload() })
         } catch (e: Exception) {
+            diagnostics.error("CallSyncClient.sync", e, "batch" to pending.size)
             SyncOutcome.TRANSIENT_FAILURE
         }
 
@@ -53,10 +70,19 @@ class CallSyncWorker(
 
         dao.applySyncResult(pending.map { it.id }, nextStatus, now)
 
-        diagnostics.recordSync("$outcome -> $nextStatus (${pending.size} calls)", now)
-        diagnostics.log(
-            DiagnosticEvents.SYNC,
-            "batch=" + pending.size + " outcome=" + outcome + " status=" + nextStatus
+        val succeeded = outcome == SyncOutcome.SUCCESS
+        diagnostics.recordSync("$outcome -> $nextStatus (${pending.size} calls)", succeeded, now)
+        diagnostics.event(
+            if (succeeded) DiagnosticEvents.SYNC_SUCCEEDED else DiagnosticEvents.SYNC_FAILED,
+            "batch" to pending.size,
+            "outcome" to outcome,
+            "status" to nextStatus,
+            "attempts" to (worstAttempts + 1),
+            "willRetry" to SyncStateMachine.shouldRetry(nextStatus)
+        )
+        diagnostics.event(
+            DiagnosticEvents.WORKER_FINISHED,
+            "worker" to DiagnosticEvents.WORKER_SYNC, "result" to nextStatus
         )
 
         return if (SyncStateMachine.shouldRetry(nextStatus)) Result.retry() else Result.success()

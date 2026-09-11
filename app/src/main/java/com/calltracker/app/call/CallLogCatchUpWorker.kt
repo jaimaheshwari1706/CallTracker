@@ -30,15 +30,28 @@ class CallLogCatchUpWorker(
 
     override suspend fun doWork(): Result {
         val diagnostics = DiagnosticsStore(applicationContext)
+        diagnostics.recordCatchUpRun()
+        diagnostics.event(
+            DiagnosticEvents.WORKER_STARTED,
+            "worker" to DiagnosticEvents.WORKER_CATCH_UP, "attempt" to runAttemptCount
+        )
 
         if (!DeviceInfoProvider.hasCallLogPermission(applicationContext)) {
-            diagnostics.log(DiagnosticEvents.PERMISSION, "catch-up skipped: READ_CALL_LOG denied")
+            diagnostics.event(
+                DiagnosticEvents.WORKER_FINISHED,
+                "worker" to DiagnosticEvents.WORKER_CATCH_UP,
+                "result" to "SKIPPED", "reason" to "READ_CALL_LOG denied"
+            )
             return Result.success()
         }
 
         val result = CallCaptureEngine(applicationContext).scan(ScanReason.CATCH_UP)
         if (result.stored > 0) {
             CallSyncScheduler.requestSync(applicationContext)
+            diagnostics.event(
+                DiagnosticEvents.CALL_SYNC_QUEUED,
+                "reason" to ScanReason.CATCH_UP, "stored" to result.stored
+            )
         }
 
         // If the service is not running (OEM kill, FGS timeout), try to bring it
@@ -46,16 +59,28 @@ class CallLogCatchUpWorker(
         // context the platform permits an FGS start from. If the platform still
         // refuses, the service records that and this worker keeps carrying
         // capture on its own - we do not retry in a loop to force it.
+        var serviceRestart = "not needed"
         if (!diagnostics.monitoringActive) {
-            runCatching { CallMonitorService.start(applicationContext) }
-                .onFailure {
-                    diagnostics.log(
-                        DiagnosticEvents.ERROR,
-                        "catch-up could not restart service: " + it.javaClass.simpleName
-                    )
-                }
+            serviceRestart = runCatching { CallMonitorService.start(applicationContext) }
+                .fold(
+                    onSuccess = { "requested" },
+                    onFailure = { e ->
+                        diagnostics.error("CallLogCatchUpWorker.restartService", e)
+                        "refused:" + e.javaClass.simpleName
+                    }
+                )
         }
 
+        diagnostics.event(
+            DiagnosticEvents.WORKER_FINISHED,
+            "worker" to DiagnosticEvents.WORKER_CATCH_UP,
+            "result" to (result.error ?: "OK"),
+            "rows" to result.rowsExamined,
+            "stored" to result.stored,
+            "excluded" to result.excluded,
+            "duplicates" to result.duplicates,
+            "serviceRestart" to serviceRestart
+        )
         return Result.success()
     }
 }

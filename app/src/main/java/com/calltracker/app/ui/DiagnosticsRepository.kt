@@ -5,6 +5,7 @@ import com.calltracker.app.database.AppDatabase
 import com.calltracker.app.database.CallEntity
 import com.calltracker.app.database.DiagnosticEventEntity
 import com.calltracker.app.database.ExcludedNumberEntity
+import com.calltracker.app.diagnostics.DiagnosticEvents
 import com.calltracker.app.diagnostics.DiagnosticsSnapshot
 import com.calltracker.app.diagnostics.DiagnosticsStore
 import kotlinx.coroutines.flow.Flow
@@ -21,7 +22,12 @@ data class DiagnosticsUiState(
     val lastCapturedAt: Long = 0L,
     val recentCalls: List<CallEntity> = emptyList(),
     val excludedNumbers: List<ExcludedNumberEntity> = emptyList(),
-    val events: List<DiagnosticEventEntity> = emptyList()
+    /** Newest first, as stored. */
+    val events: List<DiagnosticEventEntity> = emptyList(),
+    /** Call-log id of the most recently evaluated row, or null. */
+    val lastCallTraceId: String? = null,
+    /** Every event carrying that id, oldest first — "what happened during the last call". */
+    val lastCallTrace: List<DiagnosticEventEntity> = emptyList()
 )
 
 /**
@@ -55,6 +61,7 @@ class DiagnosticsRepository(context: Context) {
     }
 
     val state: Flow<DiagnosticsUiState> = combine(counts, details) { c, d ->
+        val traceId = lastEvaluatedCallLogId(d.events)
         DiagnosticsUiState(
             runtime = d.runtime,
             capturedCount = c.captured,
@@ -65,7 +72,9 @@ class DiagnosticsRepository(context: Context) {
             lastCapturedAt = d.lastCapturedAt,
             recentCalls = d.recentCalls,
             excludedNumbers = d.excludedNumbers,
-            events = d.events
+            events = d.events,
+            lastCallTraceId = traceId,
+            lastCallTrace = if (traceId == null) emptyList() else traceFor(traceId, d.events)
         )
     }
 
@@ -87,6 +96,26 @@ class DiagnosticsRepository(context: Context) {
 
     companion object {
         private const val RECENT_CALLS = 25
-        private const val RECENT_EVENTS = 200
+        private const val RECENT_EVENTS = 300
+
+        private val CALL_LOG_ID = Regex("(?:^| )callLogId=([0-9]+)(?: |$)")
+
+        /**
+         * The call-log id from the newest CALL_ROW_EVALUATED event. Pure so it
+         * is unit-testable.
+         */
+        fun lastEvaluatedCallLogId(eventsNewestFirst: List<DiagnosticEventEntity>): String? =
+            eventsNewestFirst
+                .firstOrNull { it.type == DiagnosticEvents.CALL_ROW_EVALUATED }
+                ?.let { CALL_LOG_ID.find(it.detail)?.groupValues?.get(1) }
+
+        /** Every event mentioning [callLogId], oldest first. */
+        fun traceFor(
+            callLogId: String,
+            eventsNewestFirst: List<DiagnosticEventEntity>
+        ): List<DiagnosticEventEntity> =
+            eventsNewestFirst
+                .filter { CALL_LOG_ID.find(it.detail)?.groupValues?.get(1) == callLogId }
+                .asReversed()
     }
 }

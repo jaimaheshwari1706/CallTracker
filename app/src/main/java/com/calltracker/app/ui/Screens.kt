@@ -1,5 +1,6 @@
 package com.calltracker.app.ui
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -12,6 +13,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
@@ -27,16 +29,20 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.calltracker.app.database.CallEntity
+import com.calltracker.app.database.DiagnosticEventEntity
 import com.calltracker.app.database.ExcludedNumberEntity
 import com.calltracker.app.diagnostics.DeviceInfo
-import java.text.SimpleDateFormat
-import java.util.Date
-import java.util.Locale
+import com.calltracker.app.diagnostics.Format
+import com.calltracker.app.diagnostics.PreflightAction
+import com.calltracker.app.diagnostics.PreflightCheck
+import com.calltracker.app.diagnostics.PreflightChecker
+import com.calltracker.app.diagnostics.PreflightStatus
 
 /**
  * Screen order is deliberate: explanation -> per-permission rationale ->
@@ -145,19 +151,26 @@ fun PermissionRequestScreen(
 fun DiagnosticsScreen(
     state: DiagnosticsUiState,
     device: DeviceInfo,
+    preflight: List<PreflightCheck>,
     callLogGranted: Boolean,
     phoneStateGranted: Boolean,
     contactsGranted: Boolean,
+    notificationsGranted: Boolean,
+    onRerunPreflight: () -> Unit,
+    onPreflightAction: (PreflightAction) -> Unit,
     onStartMonitoring: () -> Unit,
     onStopMonitoring: () -> Unit,
     onRescan: () -> Unit,
     onSyncNow: () -> Unit,
     onRetryFailed: () -> Unit,
     onBatterySettings: () -> Unit,
-    onClearLog: () -> Unit,
+    onClearDiagnostics: () -> Unit,
     onAddExcludedNumber: (String) -> Unit,
-    onRemoveExcludedNumber: (String) -> Unit
+    onRemoveExcludedNumber: (String) -> Unit,
+    onDryRunPrivacy: (String) -> Unit
 ) {
+    val overall = PreflightChecker.overall(preflight)
+
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
         contentPadding = PaddingValues(16.dp),
@@ -165,13 +178,53 @@ fun DiagnosticsScreen(
     ) {
         item {
             Text("CallTracker diagnostics", style = MaterialTheme.typography.headlineSmall)
+            Text(
+                "Technical POC. PASS here means the pipeline is wired on this device, " +
+                    "not that background capture is proven.",
+                fontSize = 12.sp
+            )
         }
 
+        // ------------------------------------------------------------------
+        // Pre-flight
+        // ------------------------------------------------------------------
+        item { SectionHeader("Pre-flight") }
+        item {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                StatusBadge(overall)
+                Spacer(Modifier.padding(horizontal = 6.dp))
+                Text(
+                    when (overall) {
+                        PreflightStatus.PASS -> "All checks passed. Ready for Phase 2."
+                        PreflightStatus.WARNING -> "Ready with warnings. Read them before testing background phases."
+                        PreflightStatus.FAIL -> "Not ready. Fix the FAIL rows before making test calls."
+                    },
+                    fontSize = 13.sp,
+                    modifier = Modifier.weight(1f)
+                )
+                OutlinedButton(onClick = onRerunPreflight) { Text("Re-run", fontSize = 12.sp) }
+            }
+        }
+        if (preflight.isEmpty()) {
+            item { Text("Running checks...", fontSize = 13.sp) }
+        } else {
+            items(preflight, key = { "preflight-" + it.name }) { check ->
+                PreflightRow(check, onPreflightAction)
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // Permissions (raw)
+        // ------------------------------------------------------------------
         item { SectionHeader("Permissions") }
         item { StatusRow("Call log (READ_CALL_LOG)", grant(callLogGranted)) }
         item { StatusRow("Phone state (READ_PHONE_STATE)", grant(phoneStateGranted)) }
         item { StatusRow("Contacts (READ_CONTACTS, optional)", grant(contactsGranted)) }
+        item { StatusRow("Notifications (POST_NOTIFICATIONS)", grant(notificationsGranted)) }
 
+        // ------------------------------------------------------------------
+        // Monitoring
+        // ------------------------------------------------------------------
         item { SectionHeader("Monitoring") }
         item {
             StatusRow(
@@ -179,7 +232,19 @@ fun DiagnosticsScreen(
                 if (state.runtime.monitoringActive) "ACTIVE" else "INACTIVE"
             )
         }
-        item { StatusRow("Started", timeOrDash(state.runtime.monitoringStartedAt)) }
+        item { StatusRow("Last started", timeOrDash(state.runtime.monitoringStartedAt)) }
+        item {
+            StatusRow(
+                "ContentObserver registered",
+                if (state.runtime.observerRegistered) "YES" else "NO"
+            )
+        }
+        item {
+            StatusRow(
+                "TelephonyCallback registered",
+                if (state.runtime.telephonyRegistered) "YES" else "NO"
+            )
+        }
         item {
             StatusRow(
                 "Last ContentObserver event",
@@ -195,7 +260,18 @@ fun DiagnosticsScreen(
                     timeOrDash(state.runtime.lastTelephonyStateAt)
             )
         }
+        item {
+            StatusRow(
+                "Last scan",
+                timeOrDash(state.runtime.lastScanAt) +
+                    if (state.runtime.lastScanReason.isEmpty()) "" else "  " + state.runtime.lastScanReason
+            )
+        }
+        if (state.runtime.lastScanSummary.isNotEmpty()) {
+            item { StatusRow("Last scan result", state.runtime.lastScanSummary) }
+        }
         item { StatusRow("Highest call-log id scanned", state.runtime.lastProcessedCallLogId.toString()) }
+        item { StatusRow("Last catch-up worker run", timeOrDash(state.runtime.lastCatchUpRunAt)) }
         if (state.runtime.lastForegroundTimeoutAt > 0L) {
             item {
                 StatusRow(
@@ -205,13 +281,19 @@ fun DiagnosticsScreen(
             }
         }
 
+        // ------------------------------------------------------------------
+        // Calls
+        // ------------------------------------------------------------------
         item { SectionHeader("Calls") }
-        item { StatusRow("Captured", state.capturedCount.toString()) }
+        item { StatusRow("Stored", state.capturedCount.toString()) }
         item { StatusRow("Excluded by privacy filter", state.excludedCount.toString()) }
+        item { StatusRow("Duplicates detected", state.runtime.duplicateCount.toString()) }
         item { StatusRow("Pending sync", state.pendingCount.toString()) }
         item { StatusRow("Synced", state.syncedCount.toString()) }
         item { StatusRow("Failed", state.failedCount.toString()) }
-        item { StatusRow("Last captured call", timeOrDash(state.lastCapturedAt)) }
+        item { StatusRow("Sync runs succeeded", state.runtime.syncSucceededCount.toString()) }
+        item { StatusRow("Sync runs failed", state.runtime.syncFailedCount.toString()) }
+        item { StatusRow("Last stored call", timeOrDash(state.lastCapturedAt)) }
         item {
             StatusRow(
                 "Last sync",
@@ -220,6 +302,33 @@ fun DiagnosticsScreen(
             )
         }
 
+        // ------------------------------------------------------------------
+        // Last call trace
+        // ------------------------------------------------------------------
+        item { SectionHeader("Last call trace") }
+        if (state.lastCallTrace.isEmpty()) {
+            item {
+                Text(
+                    "No call has been evaluated yet. After a call, every event carrying " +
+                        "that call-log id appears here in order.",
+                    fontSize = 12.sp
+                )
+            }
+        } else {
+            item {
+                Text(
+                    "callLogId=" + state.lastCallTraceId + " — " + state.lastCallTrace.size + " events",
+                    fontSize = 12.sp, fontWeight = FontWeight.Bold
+                )
+            }
+            items(state.lastCallTrace, key = { "trace-" + it.id }) { event ->
+                EventLine(event)
+            }
+        }
+
+        // ------------------------------------------------------------------
+        // Device
+        // ------------------------------------------------------------------
         item { SectionHeader("Device") }
         item { StatusRow("Manufacturer", device.manufacturer) }
         item { StatusRow("Model", device.model) }
@@ -255,6 +364,9 @@ fun DiagnosticsScreen(
             }
         }
 
+        // ------------------------------------------------------------------
+        // Actions
+        // ------------------------------------------------------------------
         item { SectionHeader("Actions") }
         item {
             Column {
@@ -271,11 +383,20 @@ fun DiagnosticsScreen(
                 Spacer(Modifier.height(8.dp))
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     OutlinedButton(onClick = onBatterySettings) { Text("Battery settings") }
-                    OutlinedButton(onClick = onClearLog) { Text("Clear log") }
+                    OutlinedButton(onClick = onClearDiagnostics) { Text("Clear diagnostics") }
                 }
+                Text(
+                    "Clear diagnostics empties the event log and resets the counters above. " +
+                        "It never touches stored calls, the processed-row ledger, the scan " +
+                        "watermark, or the exclusion list.",
+                    fontSize = 11.sp
+                )
             }
         }
 
+        // ------------------------------------------------------------------
+        // Privacy
+        // ------------------------------------------------------------------
         item { SectionHeader("Privacy exclusions") }
         item {
             // Deliberately the smallest thing that makes the privacy filter
@@ -285,11 +406,15 @@ fun DiagnosticsScreen(
             ExcludedNumberEditor(
                 excluded = state.excludedNumbers,
                 onAdd = onAddExcludedNumber,
-                onRemove = onRemoveExcludedNumber
+                onRemove = onRemoveExcludedNumber,
+                onDryRun = onDryRunPrivacy
             )
         }
 
-        item { SectionHeader("Recent captured calls") }
+        // ------------------------------------------------------------------
+        // Recent calls + full event log
+        // ------------------------------------------------------------------
+        item { SectionHeader("Recent stored calls") }
         if (state.recentCalls.isEmpty()) {
             item { Text("None yet.", fontSize = 13.sp) }
         } else {
@@ -299,26 +424,77 @@ fun DiagnosticsScreen(
             items(state.recentCalls, key = { "call-" + it.id }) { call -> CallRow(call) }
         }
 
-        item { SectionHeader("Event log") }
+        item { SectionHeader("Event log (newest first)") }
         if (state.events.isEmpty()) {
             item { Text("Empty.", fontSize = 13.sp) }
         } else {
-            items(state.events, key = { "event-" + it.id }) { event ->
-                Text(
-                    clock(event.atEpochMs) + "  " + event.type.padEnd(18) + " " + event.detail,
-                    fontFamily = FontFamily.Monospace,
-                    fontSize = 11.sp
-                )
+            items(state.events, key = { "event-" + it.id }) { event -> EventLine(event) }
+        }
+    }
+}
+
+@Composable
+private fun PreflightRow(check: PreflightCheck, onAction: (PreflightAction) -> Unit) {
+    Card(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(10.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                StatusBadge(check.status)
+                Spacer(Modifier.padding(horizontal = 4.dp))
+                Text(check.name, fontWeight = FontWeight.Bold, fontSize = 13.sp, modifier = Modifier.weight(1f))
+                Text(check.detail, fontSize = 12.sp, fontFamily = FontFamily.Monospace)
+            }
+            check.why?.let { Text(it, fontSize = 12.sp, modifier = Modifier.padding(top = 4.dp)) }
+            check.action?.let { action ->
+                OutlinedButton(onClick = { onAction(action) }, modifier = Modifier.padding(top = 4.dp)) {
+                    Text(
+                        when (action) {
+                            PreflightAction.OPEN_APP_SETTINGS -> "Open app settings"
+                            PreflightAction.OPEN_NOTIFICATION_SETTINGS -> "Open notification settings"
+                            PreflightAction.OPEN_BATTERY_SETTINGS -> "Battery settings"
+                            PreflightAction.START_MONITORING -> "Start monitoring"
+                            PreflightAction.ADD_EXCLUDED_NUMBER -> "See Privacy exclusions below"
+                        },
+                        fontSize = 12.sp
+                    )
+                }
             }
         }
     }
 }
 
 @Composable
+private fun StatusBadge(status: PreflightStatus) {
+    val (label, color) = when (status) {
+        PreflightStatus.PASS -> "PASS" to Color(0xFF2E7D32)
+        PreflightStatus.WARNING -> "WARN" to Color(0xFFEF6C00)
+        PreflightStatus.FAIL -> "FAIL" to Color(0xFFC62828)
+    }
+    Text(
+        label,
+        color = Color.White,
+        fontSize = 11.sp,
+        fontWeight = FontWeight.Bold,
+        modifier = Modifier
+            .background(color, RoundedCornerShape(4.dp))
+            .padding(horizontal = 6.dp, vertical = 2.dp)
+    )
+}
+
+@Composable
+private fun EventLine(event: DiagnosticEventEntity) {
+    Text(
+        clock(event.atEpochMs) + "  " + event.type.padEnd(24) + " " + event.detail,
+        fontFamily = FontFamily.Monospace,
+        fontSize = 11.sp
+    )
+}
+
+@Composable
 private fun ExcludedNumberEditor(
     excluded: List<ExcludedNumberEntity>,
     onAdd: (String) -> Unit,
-    onRemove: (String) -> Unit
+    onRemove: (String) -> Unit,
+    onDryRun: (String) -> Unit
 ) {
     var input by remember { mutableStateOf("") }
     Column(Modifier.fillMaxWidth()) {
@@ -327,24 +503,32 @@ private fun ExcludedNumberEditor(
             fontSize = 12.sp
         )
         Spacer(Modifier.height(6.dp))
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            OutlinedTextField(
-                value = input,
-                onValueChange = { input = it },
-                label = { Text("Personal number") },
-                singleLine = true,
-                modifier = Modifier.weight(1f)
-            )
+        OutlinedTextField(
+            value = input,
+            onValueChange = { input = it },
+            label = { Text("Phone number") },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth()
+        )
+        Spacer(Modifier.height(6.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Button(
                 onClick = {
                     if (input.isNotBlank()) {
                         onAdd(input.trim())
                         input = ""
                     }
-                },
-                modifier = Modifier.padding(start = 8.dp)
+                }
             ) { Text("Exclude") }
+            OutlinedButton(
+                onClick = { if (input.isNotBlank()) onDryRun(input.trim()) }
+            ) { Text("Dry-run check") }
         }
+        Text(
+            "Dry-run runs the typed number through normalize -> privacy filter only and " +
+                "writes a SIMULATED line to the event log. It stores nothing and is not a call.",
+            fontSize = 11.sp
+        )
         Spacer(Modifier.height(6.dp))
         if (excluded.isEmpty()) {
             Text("No numbers excluded.", fontSize = 12.sp)
@@ -411,11 +595,6 @@ private fun StatusRow(label: String, value: String) {
 
 private fun grant(granted: Boolean) = if (granted) "GRANTED" else "DENIED"
 
-private val clockFormat = SimpleDateFormat("HH:mm:ss", Locale.US)
-private val stampFormat = SimpleDateFormat("dd MMM HH:mm:ss", Locale.US)
+private fun clock(epochMs: Long): String = Format.clock(epochMs)
 
-private fun clock(epochMs: Long): String =
-    if (epochMs <= 0L) "--:--:--" else clockFormat.format(Date(epochMs))
-
-private fun timeOrDash(epochMs: Long): String =
-    if (epochMs <= 0L) "-" else stampFormat.format(Date(epochMs))
+private fun timeOrDash(epochMs: Long): String = Format.stamp(epochMs)

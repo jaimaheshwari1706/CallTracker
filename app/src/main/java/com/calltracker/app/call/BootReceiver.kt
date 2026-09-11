@@ -56,9 +56,11 @@ class BootReceiver : BroadcastReceiver() {
         // may be torn down first. Losing one diagnostic line after a reboot is
         // acceptable; blocking the boot broadcast is not.
         CoroutineScope(Dispatchers.IO).launch {
-            diagnostics.log(
-                DiagnosticEvents.BOOT,
-                "boot received; catch-up scheduled; service start=" + (startError ?: "requested")
+            diagnostics.event(
+                DiagnosticEvents.BOOT_RECEIVED,
+                "action" to action,
+                "catchUp" to "scheduled",
+                "serviceStart" to (startError ?: "requested")
             )
         }
     }

@@ -44,7 +44,10 @@ class CallCaptureEngine(
 
     suspend fun scan(reason: ScanReason): ScanResult = SCAN_MUTEX.withLock {
         if (!DeviceInfoProvider.hasCallLogPermission(context)) {
-            diagnostics.log(DiagnosticEvents.PERMISSION, "READ_CALL_LOG denied - scan skipped")
+            diagnostics.event(
+                DiagnosticEvents.SCAN_STARTED,
+                "reason" to reason, "result" to "SKIPPED", "cause" to "READ_CALL_LOG denied"
+            )
             return@withLock ScanResult(reason, skippedNoPermission = true)
         }
 
@@ -56,21 +59,23 @@ class CallCaptureEngine(
             CallLogReader.CATCH_UP_LIMIT
         }
 
-        diagnostics.log(
-            DiagnosticEvents.SCAN,
-            "START reason=" + reason + " after=" + (watermark ?: "-") + " limit=" + limit
+        diagnostics.event(
+            DiagnosticEvents.SCAN_STARTED,
+            "reason" to reason, "after" to (watermark ?: "-"), "limit" to limit
         )
 
         val rows = try {
             reader.query(afterId = watermark, limit = limit)
         } catch (e: SecurityException) {
             // Permission revoked between the check above and the query.
-            diagnostics.log(DiagnosticEvents.ERROR, "call log query denied: " + e.javaClass.simpleName)
+            diagnostics.error("CallLogReader.query", e, "reason" to reason)
             return@withLock ScanResult(reason, error = "SecurityException", skippedNoPermission = true)
         } catch (e: Exception) {
-            diagnostics.log(DiagnosticEvents.ERROR, "call log query failed: " + e.javaClass.simpleName)
+            diagnostics.error("CallLogReader.query", e, "reason" to reason)
             return@withLock ScanResult(reason, error = e.javaClass.simpleName)
         }
+
+        diagnostics.event(DiagnosticEvents.CALL_LOG_ROWS_FOUND, "reason" to reason, "rows" to rows.size)
 
         var stored = 0
         var excluded = 0
@@ -81,7 +86,16 @@ class CallCaptureEngine(
         val examined = ArrayList<Long>(rows.size)
 
         for (row in rows) {
-            when (processRow(row)) {
+            val action = try {
+                processRow(row)
+            } catch (e: Exception) {
+                // One bad row must not abort the scan or poison the watermark:
+                // it is logged, left un-examined, and picked up by the next
+                // catch-up scan.
+                diagnostics.error("processRow", e, "callLogId" to row.id)
+                continue
+            }
+            when (action) {
                 CaptureAction.STORE -> stored++
                 CaptureAction.DISCARD_EXCLUDED -> excluded++
                 CaptureAction.SKIP_DUPLICATE -> duplicates++
@@ -94,10 +108,13 @@ class CallCaptureEngine(
             examinedRowIds = examined
         )
 
-        diagnostics.log(
-            DiagnosticEvents.SCAN,
-            "DONE reason=" + reason + " rows=" + rows.size +
-                " saved=" + stored + " excluded=" + excluded + " dup=" + duplicates
+        val summary = "rows=" + rows.size + " stored=" + stored +
+            " excluded=" + excluded + " duplicates=" + duplicates
+        diagnostics.recordScan(reason.name, summary, duplicates)
+        diagnostics.event(
+            DiagnosticEvents.SCAN_FINISHED,
+            "reason" to reason, "rows" to rows.size, "stored" to stored,
+            "excluded" to excluded, "duplicates" to duplicates
         )
 
         ScanResult(
@@ -127,18 +144,26 @@ class CallCaptureEngine(
         if (alreadyProcessed) {
             // CapturePipeline.decide() states this rule; it is short-circuited
             // here so a duplicate notification does not cost a privacy-list read.
-            diagnostics.log(DiagnosticEvents.DUPLICATE_SKIPPED, "id=" + deviceCallId)
+            diagnostics.event(
+                DiagnosticEvents.CALL_DUPLICATE,
+                "callLogId" to deviceCallId, "reason" to "already in processed ledger"
+            )
             return CaptureAction.SKIP_DUPLICATE
         }
 
         val duration = sanitizeDuration(row.durationSeconds)
-        diagnostics.log(
-            DiagnosticEvents.CALL_LOG_READ,
-            "id=" + deviceCallId + " type=" + row.type + " dur=" + duration + "s"
-        )
 
         // Step 3. Normalize.
         val normalized = normalizePhoneNumber(row.number)
+
+        diagnostics.event(
+            DiagnosticEvents.CALL_ROW_EVALUATED,
+            "callLogId" to deviceCallId,
+            "type" to row.type,
+            "durationS" to duration,
+            "num" to maskForDiagnostics(normalized),
+            "fp" to fingerprintForDiagnostics(normalized)
+        )
 
         // Step 4. Privacy filter, before anything is persisted or queued.
         val decision = privacyFilter.evaluate(normalized)
@@ -146,25 +171,38 @@ class CallCaptureEngine(
             // Record ONLY that this call-log id was excluded. No number, no
             // name, no call timestamp. Nothing that could later be uploaded.
             val firstTime = dao.recordExcluded(deviceCallId)
-            diagnostics.log(DiagnosticEvents.PRIVACY_CHECK, "EXCLUDED id=" + deviceCallId)
-            return if (firstTime) CaptureAction.DISCARD_EXCLUDED else CaptureAction.SKIP_DUPLICATE
+            if (firstTime) {
+                diagnostics.event(
+                    DiagnosticEvents.CALL_EXCLUDED_PRIVACY,
+                    "callLogId" to deviceCallId, "result" to decision,
+                    "fp" to fingerprintForDiagnostics(normalized)
+                )
+                return CaptureAction.DISCARD_EXCLUDED
+            }
+            diagnostics.event(
+                DiagnosticEvents.CALL_DUPLICATE,
+                "callLogId" to deviceCallId, "reason" to "excluded marker raced"
+            )
+            return CaptureAction.SKIP_DUPLICATE
         }
 
-        val withheldNote =
-            if (decision == PrivacyDecision.ALLOW_UNRESOLVED_NUMBER) " (caller id withheld)" else ""
-        diagnostics.log(
-            DiagnosticEvents.PRIVACY_CHECK,
-            "PASSED id=" + deviceCallId + " " + maskForDiagnostics(normalized) + withheldNote
+        diagnostics.event(
+            DiagnosticEvents.CALL_ALLOWED,
+            "callLogId" to deviceCallId,
+            "result" to decision,
+            "note" to if (decision == PrivacyDecision.ALLOW_UNRESOLVED_NUMBER) "caller id withheld" else null
         )
 
         // Step 5. Persist.
         val sim = simResolver.resolve(row.phoneAccountId)
-        if (sim.resolution != SimResolution.RESOLVED && sim.resolution != SimResolution.SINGLE_SIM) {
-            diagnostics.log(
-                DiagnosticEvents.SIM,
-                sim.resolution.toString() + " phoneAccountId=" + (row.phoneAccountId ?: "-")
-            )
-        }
+        diagnostics.event(
+            DiagnosticEvents.SIM_RESOLUTION,
+            "callLogId" to deviceCallId,
+            "result" to sim.resolution,
+            "slot" to sim.slotIndex,
+            "subId" to sim.subscriptionId,
+            "phoneAccountId" to (row.phoneAccountId ?: "-")
+        )
 
         val entity = CallEntity(
             deviceCallId = deviceCallId,
@@ -184,14 +222,21 @@ class CallCaptureEngine(
 
         val inserted = dao.recordAccepted(entity)
         return if (inserted) {
-            diagnostics.log(
-                DiagnosticEvents.CALL_SAVED,
-                "id=" + deviceCallId + " " + entity.direction + "/" + entity.status +
-                    " " + duration + "s"
+            diagnostics.event(
+                DiagnosticEvents.CALL_STORED,
+                "callLogId" to deviceCallId,
+                "direction" to entity.direction,
+                "status" to entity.status,
+                "durationS" to duration,
+                "sim" to sim.resolution,
+                "syncStatus" to entity.syncStatus
             )
             CaptureAction.STORE
         } else {
-            diagnostics.log(DiagnosticEvents.DUPLICATE_SKIPPED, "id=" + deviceCallId + " (insert raced)")
+            diagnostics.event(
+                DiagnosticEvents.CALL_DUPLICATE,
+                "callLogId" to deviceCallId, "reason" to "insert raced"
+            )
             CaptureAction.SKIP_DUPLICATE
         }
     }

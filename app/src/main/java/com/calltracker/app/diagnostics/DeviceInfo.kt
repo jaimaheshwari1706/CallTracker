@@ -110,4 +110,9 @@ object DeviceInfoProvider {
 
     fun hasContactsPermission(context: Context) =
         hasPermission(context, Manifest.permission.READ_CONTACTS)
+
+    /** POST_NOTIFICATIONS only exists from API 33; below that it is implicitly granted. */
+    fun hasNotificationPermission(context: Context): Boolean =
+        Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU ||
+            hasPermission(context, Manifest.permission.POST_NOTIFICATIONS)
 }

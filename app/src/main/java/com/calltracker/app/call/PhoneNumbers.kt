@@ -88,3 +88,25 @@ fun maskForDiagnostics(normalized: String): String {
     if (digits.length <= 4) return "*".repeat(digits.length)
     return "*".repeat(digits.length - 4) + digits.takeLast(4)
 }
+
+/**
+ * A short, stable fingerprint of a normalized number for the diagnostic log.
+ *
+ * Masking (`********3210`) is readable but two different numbers can share a
+ * suffix. The fingerprint lets a tester confirm "these three events were the
+ * same number" without the number ever appearing in the log. SHA-256 truncated
+ * to 8 hex chars is plenty for correlation and useless for recovery of the
+ * number at POC volumes; it is NOT a security control and is not claimed as one.
+ */
+fun fingerprintForDiagnostics(normalized: String): String {
+    if (normalized == UNKNOWN_NUMBER) return UNKNOWN_NUMBER
+    val digest = java.security.MessageDigest.getInstance("SHA-256")
+        .digest(normalized.toByteArray(Charsets.UTF_8))
+    val sb = StringBuilder(8)
+    for (i in 0 until 4) {
+        val b = digest[i].toInt() and 0xff
+        if (b < 0x10) sb.append('0')
+        sb.append(Integer.toHexString(b))
+    }
+    return sb.toString()
+}

@@ -80,7 +80,11 @@ class CallMonitorService : Service() {
         registerContentObserver()
 
         serviceScope.launch {
-            diagnostics.log(DiagnosticEvents.SERVICE_STARTED, "monitoring started")
+            diagnostics.event(
+                DiagnosticEvents.SERVICE_STARTED,
+                "observer" to diagnostics.observerRegistered,
+                "telephony" to diagnostics.telephonyRegistered
+            )
             logPermissionState()
             // Covers whatever happened while the process was not running:
             // OEM kill, reboot, force stop, first install.
@@ -120,12 +124,7 @@ class CallMonitorService : Service() {
             // type/permission mismatch. Both are legitimate OS decisions. We
             // record them and let the periodic WorkManager catch-up carry the
             // capture instead of trying to defeat the restriction.
-            serviceScope.launch {
-                diagnostics.log(
-                    DiagnosticEvents.ERROR,
-                    "startForeground refused: " + e.javaClass.simpleName
-                )
-            }
+            serviceScope.launch { diagnostics.error("startForeground", e) }
             diagnostics.monitoringActive = false
             stopSelf()
             false
@@ -168,9 +167,11 @@ class CallMonitorService : Service() {
     override fun onTimeout(startId: Int, fgsType: Int) {
         diagnostics.lastForegroundTimeoutAt = System.currentTimeMillis()
         serviceScope.launch {
-            diagnostics.log(
+            diagnostics.event(
                 DiagnosticEvents.SERVICE_TIMEOUT,
-                "Android 15 dataSync FGS time limit reached; falling back to periodic catch-up"
+                "reason" to "Android 15 dataSync time budget exhausted",
+                "fgsType" to fgsType,
+                "fallback" to "periodic catch-up worker"
             )
         }
         stopSelf()
@@ -180,10 +181,12 @@ class CallMonitorService : Service() {
 
     private fun registerCallStateWatcher() {
         if (!DeviceInfoProvider.hasPhoneStatePermission(this)) {
+            diagnostics.telephonyRegistered = false
             serviceScope.launch {
-                diagnostics.log(
-                    DiagnosticEvents.PERMISSION,
-                    "READ_PHONE_STATE denied - telephony signal unavailable"
+                diagnostics.event(
+                    DiagnosticEvents.PERMISSION_CHANGED,
+                    "permission" to "READ_PHONE_STATE", "state" to "DENIED",
+                    "effect" to "telephony signal unavailable"
                 )
             }
             return
@@ -200,6 +203,7 @@ class CallMonitorService : Service() {
                 }
                 telephonyCallback = callback
                 tm.registerTelephonyCallback(ContextCompat.getMainExecutor(this), callback)
+                diagnostics.telephonyRegistered = true
             } else {
                 // Documented compatibility reason: TelephonyCallback does not exist
                 // before API 31 and minSdk is 26. This branch is never taken on
@@ -213,11 +217,11 @@ class CallMonitorService : Service() {
                 telephonyCallback = listener
                 @Suppress("DEPRECATION")
                 tm.listen(listener, android.telephony.PhoneStateListener.LISTEN_CALL_STATE)
+                diagnostics.telephonyRegistered = true
             }
         } catch (e: SecurityException) {
-            serviceScope.launch {
-                diagnostics.log(DiagnosticEvents.ERROR, "telephony listen refused: " + e.javaClass.simpleName)
-            }
+            diagnostics.telephonyRegistered = false
+            serviceScope.launch { diagnostics.error("registerTelephonyCallback", e) }
         }
     }
 
@@ -229,7 +233,7 @@ class CallMonitorService : Service() {
             else -> "UNKNOWN($state)"
         }
         diagnostics.recordTelephonyState(label)
-        serviceScope.launch { diagnostics.log(DiagnosticEvents.TELEPHONY, label) }
+        serviceScope.launch { diagnostics.event(DiagnosticEvents.TELEPHONY_STATE, "state" to label) }
 
         // OFFHOOK means a call is in progress - there is nothing in the call log
         // to read yet, so it is recorded for the matrix and nothing more.
@@ -248,10 +252,12 @@ class CallMonitorService : Service() {
 
     private fun registerContentObserver() {
         if (!DeviceInfoProvider.hasCallLogPermission(this)) {
+            diagnostics.observerRegistered = false
             serviceScope.launch {
-                diagnostics.log(
-                    DiagnosticEvents.PERMISSION,
-                    "READ_CALL_LOG denied - observer not registered"
+                diagnostics.event(
+                    DiagnosticEvents.PERMISSION_CHANGED,
+                    "permission" to "READ_CALL_LOG", "state" to "DENIED",
+                    "effect" to "ContentObserver not registered"
                 )
             }
             return
@@ -262,7 +268,10 @@ class CallMonitorService : Service() {
                 super.onChange(selfChange)
                 diagnostics.recordObserverEvent()
                 serviceScope.launch {
-                    diagnostics.log(DiagnosticEvents.CALL_LOG_CHANGED, "selfChange=" + selfChange)
+                    diagnostics.event(
+                        DiagnosticEvents.CALL_LOG_CHANGE_DETECTED,
+                        "selfChange" to selfChange
+                    )
                 }
                 scanRequests.trySend(ScanReason.CALL_LOG_CHANGED)
             }
@@ -270,11 +279,11 @@ class CallMonitorService : Service() {
         contentObserver = observer
         try {
             contentResolver.registerContentObserver(CallLog.Calls.CONTENT_URI, true, observer)
+            diagnostics.observerRegistered = true
         } catch (e: SecurityException) {
             contentObserver = null
-            serviceScope.launch {
-                diagnostics.log(DiagnosticEvents.ERROR, "observer registration refused")
-            }
+            diagnostics.observerRegistered = false
+            serviceScope.launch { diagnostics.error("registerContentObserver", e) }
         }
     }
 
@@ -286,17 +295,22 @@ class CallMonitorService : Service() {
                 val result = engine.scan(reason)
                 if (result.stored > 0) {
                     CallSyncScheduler.requestSync(applicationContext)
+                    diagnostics.event(
+                        DiagnosticEvents.CALL_SYNC_QUEUED,
+                        "reason" to reason, "stored" to result.stored
+                    )
                 }
             }
         }
     }
 
     private suspend fun logPermissionState() {
-        diagnostics.log(
-            DiagnosticEvents.PERMISSION,
-            "callLog=" + DeviceInfoProvider.hasCallLogPermission(this).grantLabel() +
-                " phoneState=" + DeviceInfoProvider.hasPhoneStatePermission(this).grantLabel() +
-                " contacts=" + DeviceInfoProvider.hasContactsPermission(this).grantLabel()
+        diagnostics.event(
+            DiagnosticEvents.PERMISSION_CHANGED,
+            "callLog" to DeviceInfoProvider.hasCallLogPermission(this).grantLabel(),
+            "phoneState" to DeviceInfoProvider.hasPhoneStatePermission(this).grantLabel(),
+            "contacts" to DeviceInfoProvider.hasContactsPermission(this).grantLabel(),
+            "notifications" to DeviceInfoProvider.hasNotificationPermission(this).grantLabel()
         )
     }
 
@@ -307,10 +321,12 @@ class CallMonitorService : Service() {
         contentObserver?.let { runCatching { contentResolver.unregisterContentObserver(it) } }
         unregisterTelephony()
         diagnostics.monitoringActive = false
+        diagnostics.observerRegistered = false
+        diagnostics.telephonyRegistered = false
         // Fire-and-forget on a scope that outlives serviceScope.cancel().
         CoroutineScope(Dispatchers.IO).launch {
             DiagnosticsStore(applicationContext)
-                .log(DiagnosticEvents.SERVICE_STOPPED, "monitoring stopped")
+                .event(DiagnosticEvents.SERVICE_STOPPED, "reason" to "onDestroy")
         }
         scanRequests.close()
         serviceScope.cancel()

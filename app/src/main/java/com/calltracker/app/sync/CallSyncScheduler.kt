@@ -30,8 +30,8 @@ import java.util.concurrent.TimeUnit
  */
 object CallSyncScheduler {
 
-    private const val SYNC_WORK = "call_sync"
-    private const val CATCH_UP_WORK = "call_log_catch_up"
+    const val SYNC_WORK = "call_sync"
+    const val CATCH_UP_WORK = "call_log_catch_up"
 
     fun requestSync(context: Context) {
         val request = OneTimeWorkRequestBuilder<CallSyncWorker>()

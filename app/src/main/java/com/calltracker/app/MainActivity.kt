@@ -18,6 +18,7 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
@@ -26,11 +27,18 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.lifecycleScope
 import com.calltracker.app.call.CallMonitorService
+import com.calltracker.app.call.PrivacyFilter
+import com.calltracker.app.call.fingerprintForDiagnostics
+import com.calltracker.app.call.maskForDiagnostics
 import com.calltracker.app.call.UNKNOWN_NUMBER
 import com.calltracker.app.call.normalizePhoneNumber
 import com.calltracker.app.database.AppDatabase
 import com.calltracker.app.database.ExcludedNumberEntity
 import com.calltracker.app.diagnostics.DeviceInfoProvider
+import com.calltracker.app.diagnostics.DiagnosticEvents
+import com.calltracker.app.diagnostics.PreflightAction
+import com.calltracker.app.diagnostics.PreflightCheck
+import com.calltracker.app.diagnostics.PreflightChecker
 import com.calltracker.app.diagnostics.DiagnosticsStore
 import com.calltracker.app.sync.CallSyncScheduler
 import com.calltracker.app.ui.ConsentScreen
@@ -100,7 +108,21 @@ class MainActivity : ComponentActivity() {
                 val contactsGranted = remember(permissionTick) {
                     DeviceInfoProvider.hasContactsPermission(this)
                 }
+                val notificationsGranted = remember(permissionTick) {
+                    DeviceInfoProvider.hasNotificationPermission(this)
+                }
                 val device = remember(permissionTick) { DeviceInfoProvider.collect(this) }
+
+                // Pre-flight re-runs on every resume (permissionTick) and on the
+                // Re-run button. It reads Room/WorkManager on IO, hence produceState.
+                var preflightTick by remember { mutableStateOf(0) }
+                val preflight by produceState<List<PreflightCheck>>(
+                    initialValue = emptyList(),
+                    key1 = permissionTick,
+                    key2 = preflightTick
+                ) {
+                    value = PreflightChecker.run(this@MainActivity)
+                }
 
                 val requiredLauncher = rememberLauncherForActivityResult(
                     ActivityResultContracts.RequestMultiplePermissions()
@@ -143,18 +165,34 @@ class MainActivity : ComponentActivity() {
                         else -> DiagnosticsScreen(
                             state = state,
                             device = device,
+                            preflight = preflight,
                             callLogGranted = callLogGranted,
                             phoneStateGranted = phoneStateGranted,
                             contactsGranted = contactsGranted,
-                            onStartMonitoring = ::startMonitoring,
-                            onStopMonitoring = { CallMonitorService.stop(this) },
+                            notificationsGranted = notificationsGranted,
+                            onRerunPreflight = { preflightTick++ },
+                            onPreflightAction = { action ->
+                                when (action) {
+                                    PreflightAction.OPEN_APP_SETTINGS -> openAppSettings()
+                                    PreflightAction.OPEN_NOTIFICATION_SETTINGS -> openNotificationSettings()
+                                    PreflightAction.OPEN_BATTERY_SETTINGS -> requestBatteryOptimizationExemption()
+                                    PreflightAction.START_MONITORING -> {
+                                        startMonitoring()
+                                        preflightTick++
+                                    }
+                                    PreflightAction.ADD_EXCLUDED_NUMBER -> Unit // the editor is on this screen
+                                }
+                            },
+                            onStartMonitoring = { startMonitoring(); preflightTick++ },
+                            onStopMonitoring = { CallMonitorService.stop(this); preflightTick++ },
                             onRescan = { CallMonitorService.requestRescan(this) },
                             onSyncNow = { CallSyncScheduler.requestSync(this) },
                             onRetryFailed = ::retryFailed,
                             onBatterySettings = ::requestBatteryOptimizationExemption,
-                            onClearLog = ::clearLog,
+                            onClearDiagnostics = ::clearDiagnostics,
                             onAddExcludedNumber = ::addExcludedNumber,
-                            onRemoveExcludedNumber = ::removeExcludedNumber
+                            onRemoveExcludedNumber = ::removeExcludedNumber,
+                            onDryRunPrivacy = ::dryRunPrivacy
                         )
                     }
                 }
@@ -232,10 +270,52 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun clearLog() {
+    /**
+     * Empties the event log and resets the diagnostic counters. Deliberately
+     * does NOT touch `calls`, the processed-row ledger, the scan watermark, the
+     * exclusion list or consent — clearing diagnostics must never change what
+     * the capture pipeline does next.
+     */
+    private fun clearDiagnostics() {
         lifecycleScope.launch(Dispatchers.IO) {
             AppDatabase.get(this@MainActivity).diagnosticEventDao().clear()
+            diagnostics.resetDiagnosticCounters()
         }
+    }
+
+    /**
+     * Developer dry-run: normalize -> PrivacyFilter, against the real on-device
+     * exclusion list, and nothing else. Writes one SIMULATED line. Does not
+     * create a call-log row, does not touch the ledger or `calls`, does not
+     * queue anything, and must never be mistaken for a detected call.
+     */
+    private fun dryRunPrivacy(raw: String) {
+        lifecycleScope.launch(Dispatchers.IO) {
+            val normalized = normalizePhoneNumber(raw)
+            val decision = PrivacyFilter(
+                AppDatabase.get(this@MainActivity).excludedNumberDao()
+            ).evaluate(normalized)
+            diagnostics.event(
+                DiagnosticEvents.SIMULATED,
+                "what" to "privacy dry-run",
+                "num" to maskForDiagnostics(normalized),
+                "fp" to fingerprintForDiagnostics(normalized),
+                "result" to decision,
+                "stored" to false
+            )
+        }
+    }
+
+    private fun openNotificationSettings() {
+        val intent = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                .putExtra(Settings.EXTRA_APP_PACKAGE, packageName)
+        } else {
+            Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                data = Uri.parse("package:$packageName")
+            }
+        }
+        runCatching { startActivity(intent) }.onFailure { openAppSettings() }
     }
 
     private fun openAppSettings() {
